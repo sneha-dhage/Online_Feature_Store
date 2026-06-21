@@ -1,0 +1,68 @@
+import requests, time
+from databricks.feature_engineering import FeatureEngineeringClient
+
+CATALOG = "ws_prd_analytics"
+SCHEMA  = "default"
+
+HOST    = spark.conf.get("spark.databricks.workspaceUrl")
+TOKEN   = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
+HEADERS = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
+
+fe = FeatureEngineeringClient()
+
+# ── Step 1: Delete serving endpoint ───────────────────────────────────────
+ENDPOINT_NAME = "auto-insurance-feature-serving"
+resp = requests.delete(
+    f"https://{HOST}/api/2.0/serving-endpoints/{ENDPOINT_NAME}",
+    headers=HEADERS
+)
+print(f"Serving endpoint delete : {resp.status_code}")
+time.sleep(5)
+
+# ── Step 2: Delete feature spec ────────────────────────────────────────────
+FEATURE_SPEC = f"{CATALOG}.{SCHEMA}.auto_policy_feature_spec"
+try:
+    fe.delete_feature_spec(name=FEATURE_SPEC)
+    print(f"Feature spec deleted   : {FEATURE_SPEC}")
+except Exception as e:
+    print(f"Feature spec           : {e}")
+
+# ── Step 3: Delete online table ────────────────────────────────────────────
+ONLINE_TABLE = f"{CATALOG}.{SCHEMA}.auto_features_active_online"
+resp = requests.delete(
+    f"https://{HOST}/api/2.0/online-tables/{ONLINE_TABLE}",
+    headers=HEADERS
+)
+print(f"Online table delete    : {resp.status_code}")
+time.sleep(10)
+
+# ── Step 4: Drop all Delta tables ──────────────────────────────────────────
+TABLES = [
+    "auto_features_active",
+    "auto_features_history",
+    "auto_features_pending",
+    "auto_policy_login_events",
+    "feature_group_registry",
+    "auto_features_raw_events_log",
+    "auto_features_dead_letter",
+]
+for tbl in TABLES:
+    spark.sql(f"DROP TABLE IF EXISTS {CATALOG}.{SCHEMA}.{tbl}")
+    print(f"Dropped table          : {tbl}")
+
+# ── Step 5: Clear landing volume files ─────────────────────────────────────
+LANDING = f"/Volumes/{CATALOG}/{SCHEMA}/landing"
+try:
+    files = dbutils.fs.ls(LANDING)
+    for f in files:
+        dbutils.fs.rm(f.path, recurse=True)
+        print(f"Removed                : {f.path}")
+    print("Landing volume cleared.")
+except Exception as e:
+    print(f"Landing                : {e}")
+
+# ── Step 6: Drop volume ────────────────────────────────────────────────────
+spark.sql(f"DROP VOLUME IF EXISTS {CATALOG}.{SCHEMA}.landing")
+print("Volume dropped         : landing")
+
+print("\nAll done. Schema is clean — ready for fresh setup.")
