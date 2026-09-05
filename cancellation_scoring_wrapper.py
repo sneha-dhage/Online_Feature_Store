@@ -17,9 +17,18 @@
 
 # COMMAND ----------
 
+# MAGIC %pip install lightgbm
+
+# COMMAND ----------
+
+dbutils.library.restartPython()
+
+# COMMAND ----------
+
 import time
 import requests
 import mlflow
+import numpy as np
 import pandas as pd
 from mlflow.models import infer_signature
 from mlflow import MlflowClient
@@ -98,12 +107,11 @@ def score_policy(policy_json: dict) -> dict:
     X = df[FEATURE_COLS].copy()
     prediction   = int(model.predict(X)[0])
     probability  = float(model.predict_proba(X)[0][1])
-    percentage   = round(probability * 100, 2)
+    status       = "Cancellation Is Coming!" if prediction == 1 else "Not Today!"
 
     return {
-        "prediction": prediction,
         "cancellation_probability": probability,
-        "cancellation_percentage": percentage,
+        "cancellation_status": status,
     }
 
 # COMMAND ----------
@@ -159,11 +167,11 @@ class CancellationScoringWrapper(mlflow.pyfunc.PythonModel):
         X = model_input[self.feature_cols].copy()
         prediction  = self.trained_model.predict(X)
         probability = self.trained_model.predict_proba(X)[:, 1]
+        status      = np.where(prediction == 1, "Cancellation Is Coming!", "Not Today!")
 
         return pd.DataFrame({
-            "prediction": prediction.astype(int),
             "cancellation_probability": probability.astype(float),
-            "cancellation_percentage": (probability * 100).astype(float),
+            "cancellation_status": status,
         })
 
 
@@ -217,49 +225,68 @@ print(f"Alias set: {SCORING_MODEL_NAME}@champion -> version {latest_version}")
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 10. Create (or reuse) the Model Serving Endpoint for the scoring wrapper
+# MAGIC ## 10. Create the Model Serving Endpoint, or update it to this version if it already exists
+# MAGIC
+# MAGIC Re-running this whole notebook always keeps the LIVE endpoint pointed at whatever version was
+# MAGIC just registered above — no separate manual update step needed.
 
 # COMMAND ----------
+
+# NOTE: the create API (POST /serving-endpoints) accepts "served_entities" with
+# entity_name/entity_version, but THIS workspace's update API (PUT .../config) requires the
+# older "served_models" field name with model_name/model_version instead — confirmed via the
+# actual 400 error: "config.served_models must contain at least one element". Using the wrong
+# field name doesn't error loudly on its own terms, so verify with a GET after any change.
 
 ep_resp = requests.get(
     f"https://{HOST}/api/2.0/serving-endpoints/{SCORING_ENDPOINT_NAME}", headers=HEADERS
 )
 
 if ep_resp.status_code == 200:
-    ep_state = ep_resp.json().get("state", {})
-    print(f"Endpoint already exists: ready={ep_state.get('ready')} config_update={ep_state.get('config_update')}")
+    print(f"Endpoint exists — updating to version {latest_version} ...")
+    ur = requests.put(
+        f"https://{HOST}/api/2.0/serving-endpoints/{SCORING_ENDPOINT_NAME}/config",
+        headers=HEADERS,
+        json={"served_models": [{
+            "name": "cancellation-scorer",
+            "model_name": SCORING_MODEL_NAME,
+            "model_version": str(latest_version),
+            "workload_size": "Small",
+            "scale_to_zero_enabled": True,
+        }]},
+    )
+    if ur.status_code not in (200, 201):
+        raise RuntimeError(f"Update failed {ur.status_code}: {ur.text[:400]}")
 else:
     print(f"Creating endpoint: {SCORING_ENDPOINT_NAME} ...")
     body = {
         "name": SCORING_ENDPOINT_NAME,
-        "config": {
-            "served_entities": [{
-                "name": "cancellation-scorer",
-                "entity_name": SCORING_MODEL_NAME,
-                "entity_version": str(latest_version),
-                "workload_size": "Small",
-                "scale_to_zero_enabled": True,
-            }]
-        }
+        "config": {"served_entities": [{
+            "name": "cancellation-scorer",
+            "entity_name": SCORING_MODEL_NAME,
+            "entity_version": str(latest_version),
+            "workload_size": "Small",
+            "scale_to_zero_enabled": True,
+        }]},
     }
     cr = requests.post(f"https://{HOST}/api/2.0/serving-endpoints", headers=HEADERS, json=body)
     if cr.status_code not in (200, 201):
         raise RuntimeError(f"Create failed {cr.status_code}: {cr.text[:400]}")
 
-    print("Endpoint created. Waiting for READY (up to 20 min)...")
-    for i in range(60):
-        poll   = requests.get(f"https://{HOST}/api/2.0/serving-endpoints/{SCORING_ENDPOINT_NAME}", headers=HEADERS)
-        ep     = poll.json().get("state", {})
-        ready  = ep.get("ready", "unknown")
-        update = ep.get("config_update", "")
-        print(f"  [{i*20}s] ready={ready}  config_update={update}")
-        if ready == "READY":
-            print("\nEndpoint is READY.")
-            break
-        if update == "UPDATE_FAILED":
-            print("\nFAILED. Check Databricks UI > Serving > Logs.")
-            break
-        time.sleep(20)
+print("Waiting for READY (up to 20 min)...")
+for i in range(60):
+    poll   = requests.get(f"https://{HOST}/api/2.0/serving-endpoints/{SCORING_ENDPOINT_NAME}", headers=HEADERS)
+    ep     = poll.json().get("state", {})
+    ready  = ep.get("ready", "unknown")
+    update = ep.get("config_update", "")
+    print(f"  [{i*20}s] ready={ready}  config_update={update}")
+    if ready == "READY" and update != "IN_PROGRESS":
+        print("\nEndpoint is READY.")
+        break
+    if update == "UPDATE_FAILED":
+        print("\nFAILED. Check Databricks UI > Serving > Logs.")
+        break
+    time.sleep(20)
 
 # COMMAND ----------
 # MAGIC %md
