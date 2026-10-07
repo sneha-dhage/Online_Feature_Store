@@ -42,7 +42,7 @@ TABLE_NAME = ""          # e.g. "ws_prd_analytics.default.cancellation_auto_feat
 # Target: use an existing 0/1 column, or derive it from DAYS_COL
 TARGET_COL   = "target"              # used as-is if it exists in the table
 DAYS_COL     = "DAYS_TIL_NEXT_CNCL"  # used to derive the target if TARGET_COL is missing
-HORIZON_DAYS = None                  # e.g. 90 → target = 1 if 0 < days <= 90 ; None → 0 < days < 9999
+HORIZON_DAYS = 90                    # e.g. 90 → target = 1 if 0 < days <= 90 ; None → 0 < days < 9999
 
 # Keys and dates
 POLICY_COL = "PLCY_ID_SK"            # one policy can have many rows → used to group the split
@@ -542,6 +542,15 @@ X_train, X_test = X_train[selected], X_test[selected]
 neg, pos = (y_train == 0).sum(), (y_train == 1).sum()
 POS_WEIGHT = neg / max(pos, 1)
 print(f"Class ratio (neg/pos) in train: {POS_WEIGHT:.2f}")
+
+# Leakage check on ALL model features (2.5 only checked the raw table columns, not the FE_ ones)
+auc_selected = train_auc[selected].sort_values(ascending=False)
+display(auc_selected.rename("train_single_feature_auc").to_frame().head(15))
+strong = auc_selected[auc_selected > 0.85]
+if len(strong):
+    print("⚠️ These features almost predict the target on their own — check them, then add to DROP_FEATURES:")
+    for c, v in strong.items():
+        print(f"   {c}: {v:.3f}")
 
 # COMMAND ----------
 # MAGIC %md
