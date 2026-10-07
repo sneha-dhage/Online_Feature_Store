@@ -25,7 +25,7 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install lightgbm xgboost optuna shap catboost -q
+# MAGIC %pip install lightgbm xgboost optuna shap catboost seaborn matplotlib scikit-learn mlflow -q
 
 # COMMAND ----------
 
@@ -64,6 +64,15 @@ LEAKAGE_KEYWORDS = ["CNCL", "CANCEL", "NEXT_", "DAYS_TIL"]
 # Rows too recent to have a complete label (only when HORIZON_DAYS is set): drop rows with
 # DATE_COL > (max date - HORIZON_DAYS), because they haven't had HORIZON_DAYS to cancel yet.
 DROP_INCOMPLETE_LABELS = True
+
+# Features to leave out of the model. Calendar features let the model learn "which month the row
+# is from" instead of policy behaviour — that doesn't carry over to future months.
+DROP_FEATURES = ["FE_TXN_MONTH", "FE_TXN_DAYOFWEEK"]
+
+# How to hold out the test set:
+#   "time"   → train on the oldest rows, test on the newest TEST_FRACTION (how the model is used in production)
+#   "policy" → random policies, all rows of a policy on one side
+SPLIT_MODE = "time"
 
 # Training
 SEED          = 42
@@ -447,7 +456,8 @@ df_fe, onehot_cols, dropped_text = encode_categoricals(df_fe, base_features)
 df_fe.columns = [sanitize(c) for c in df_fe.columns]
 
 feature_cols = [c for c in df_fe.columns
-                if c not in {sanitize(x) for x in excluded} | {sanitize(DATE_COL), sanitize(EFF_COL)}]
+                if c not in {sanitize(x) for x in excluded} | {sanitize(DATE_COL), sanitize(EFF_COL)}
+                and c not in {sanitize(x) for x in DROP_FEATURES}]
 new_features = [c for c in feature_cols if c.startswith("FE_")]
 print(f"Engineered {len(new_features)} new features; total features: {len(feature_cols)}")
 if onehot_cols:
@@ -469,7 +479,14 @@ y_all = df_fe[TARGET_COL].astype(int).values
 groups_all = df_fe[sanitize(POLICY_COL)].values if sanitize(POLICY_COL) in df_fe.columns else None
 
 n_holdout_splits = max(2, int(round(1 / TEST_FRACTION)))
-if groups_all is not None:
+if SPLIT_MODE == "time" and sanitize(DATE_COL) in df_fe.columns:
+    # Out-of-time: everything after the cutoff date is test
+    dates = df_fe[sanitize(DATE_COL)]
+    split_date = dates.quantile(1 - TEST_FRACTION)
+    train_idx = np.where(dates <= split_date)[0]
+    test_idx = np.where(dates > split_date)[0]
+    print(f"Out-of-time split: train ≤ {split_date.date()} < test")
+elif groups_all is not None:
     splitter = StratifiedGroupKFold(n_splits=n_holdout_splits, shuffle=True, random_state=SEED)
     train_idx, test_idx = next(splitter.split(df_fe, y_all, groups_all))
 else:
@@ -480,11 +497,17 @@ train_df, test_df = df_fe.iloc[train_idx].copy(), df_fe.iloc[test_idx].copy()
 y_train, y_test = y_all[train_idx], y_all[test_idx]
 groups_train = groups_all[train_idx] if groups_all is not None else None
 
-print(f"Train: {len(train_df):,} rows, cancel rate {y_train.mean():.2%}")
-print(f"Test : {len(test_df):,} rows, cancel rate {y_test.mean():.2%}")
+print(f"Train: {len(train_df):,} rows, cancel rate {y_train.mean():.2%} ({y_train.sum()} cancels)")
+print(f"Test : {len(test_df):,} rows, cancel rate {y_test.mean():.2%} ({y_test.sum()} cancels)")
+if y_test.sum() < 10:
+    print("⚠️ Fewer than 10 cancellations in test — test metrics will be very noisy.")
 if groups_all is not None:
     overlap = set(groups_all[train_idx]) & set(groups_all[test_idx])
-    print(f"Policies in both train and test: {len(overlap)} (must be 0)")
+    if SPLIT_MODE == "time":
+        # Expected: a policy's older row is in train, its newer row in test (same as production)
+        print(f"Policies with rows in both train and test: {len(overlap)} (OK for a time split)")
+    else:
+        print(f"Policies in both train and test: {len(overlap)} (must be 0)")
 
 # COMMAND ----------
 # MAGIC %md
@@ -544,11 +567,12 @@ def build_lgbm(p):
 
 def space_lgbm(t):
     return dict(
-        n_estimators=t.suggest_int("n_estimators", 100, 1500, step=50),
+        # Small trees + bigger leaves: the training set is only a few hundred rows
+        n_estimators=t.suggest_int("n_estimators", 100, 1000, step=50),
         learning_rate=t.suggest_float("learning_rate", 0.01, 0.2, log=True),
-        num_leaves=t.suggest_int("num_leaves", 8, 128, log=True),
-        max_depth=t.suggest_int("max_depth", 3, 12),
-        min_child_samples=t.suggest_int("min_child_samples", 5, 100),
+        num_leaves=t.suggest_int("num_leaves", 4, 31, log=True),
+        max_depth=t.suggest_int("max_depth", 2, 5),
+        min_child_samples=t.suggest_int("min_child_samples", 20, 100),
         subsample=t.suggest_float("subsample", 0.5, 1.0),
         colsample_bytree=t.suggest_float("colsample_bytree", 0.4, 1.0),
         reg_alpha=t.suggest_float("reg_alpha", 1e-8, 10, log=True),
@@ -564,10 +588,10 @@ def build_xgb(p):
 
 def space_xgb(t):
     return dict(
-        n_estimators=t.suggest_int("n_estimators", 100, 1500, step=50),
+        n_estimators=t.suggest_int("n_estimators", 100, 1000, step=50),
         learning_rate=t.suggest_float("learning_rate", 0.01, 0.2, log=True),
-        max_depth=t.suggest_int("max_depth", 2, 10),
-        min_child_weight=t.suggest_float("min_child_weight", 1, 20, log=True),
+        max_depth=t.suggest_int("max_depth", 2, 5),
+        min_child_weight=t.suggest_float("min_child_weight", 3, 20, log=True),
         subsample=t.suggest_float("subsample", 0.5, 1.0),
         colsample_bytree=t.suggest_float("colsample_bytree", 0.4, 1.0),
         gamma=t.suggest_float("gamma", 0, 5),
@@ -586,9 +610,9 @@ def build_cat(p):
 
 def space_cat(t):
     return dict(
-        iterations=t.suggest_int("iterations", 200, 1500, step=100),
+        iterations=t.suggest_int("iterations", 200, 1000, step=100),
         learning_rate=t.suggest_float("learning_rate", 0.01, 0.2, log=True),
-        depth=t.suggest_int("depth", 3, 8),
+        depth=t.suggest_int("depth", 2, 5),
         l2_leaf_reg=t.suggest_float("l2_leaf_reg", 1, 10, log=True),
         auto_class_weights=t.suggest_categorical("auto_class_weights", ["None", "Balanced"]),
     )
@@ -602,8 +626,8 @@ def build_rf(p):
 def space_rf(t):
     return dict(
         n_estimators=t.suggest_int("n_estimators", 200, 800, step=100),
-        max_depth=t.suggest_int("max_depth", 3, 20),
-        min_samples_leaf=t.suggest_int("min_samples_leaf", 1, 20),
+        max_depth=t.suggest_int("max_depth", 3, 8),
+        min_samples_leaf=t.suggest_int("min_samples_leaf", 5, 30),
         max_features=t.suggest_categorical("max_features", ["sqrt", 0.3, 0.5]),
         class_weight=t.suggest_categorical("class_weight", ["balanced", "balanced_subsample", None]),
     )
